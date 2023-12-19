@@ -2,6 +2,7 @@
 use bytes::BytesMut;
 use deno_core::error::type_error;
 use deno_core::error::AnyError;
+use deno_core::external;
 use deno_core::op2;
 use deno_core::serde_v8::V8Slice;
 use deno_core::unsync::TaskQueue;
@@ -9,6 +10,7 @@ use deno_core::AsyncResult;
 use deno_core::BufView;
 use deno_core::CancelFuture;
 use deno_core::CancelHandle;
+use deno_core::ExternalPointer;
 use deno_core::JsBuffer;
 use deno_core::OpState;
 use deno_core::RcLike;
@@ -195,7 +197,14 @@ impl BoundedBufferChannelInner {
   pub fn write(&mut self, buffer: V8Slice<u8>) -> Result<(), V8Slice<u8>> {
     let next_producer_index = (self.ring_producer + 1) % BUFFER_CHANNEL_SIZE;
     if next_producer_index == self.ring_consumer {
-      return Err(buffer);
+      // Note that we may have been allowed to write because of a close/error condition, but the
+      // underlying channel is actually closed. If this is the case, we return `Ok(())`` and just
+      // drop the bytes on the floor.
+      return if self.closed || self.error.is_some() {
+        Ok(())
+      } else {
+        Err(buffer)
+      };
     }
 
     self.current_size += buffer.len();
@@ -290,17 +299,6 @@ impl BoundedBufferChannel {
     self.inner.borrow_mut()
   }
 
-  pub fn into_raw(self) -> *const BoundedBufferChannel {
-    Rc::into_raw(self.inner) as _
-  }
-
-  pub unsafe fn clone_from_raw(ptr: *const BoundedBufferChannel) -> Self {
-    let rc = Rc::from_raw(ptr as *const RefCell<BoundedBufferChannelInner>);
-    let clone = rc.clone();
-    std::mem::forget(rc);
-    std::mem::transmute(clone)
-  }
-
   pub fn read(&self, limit: usize) -> Result<Option<BufView>, AnyError> {
     self.inner().read(limit)
   }
@@ -311,6 +309,10 @@ impl BoundedBufferChannel {
 
   pub fn write_error(&self, error: AnyError) {
     self.inner().write_error(error)
+  }
+
+  pub fn can_write(&self) -> bool {
+    self.inner().can_write()
   }
 
   pub fn poll_read_ready(&self, cx: &mut Context) -> Poll<()> {
@@ -341,6 +343,7 @@ struct ReadableStreamResource {
   channel: BoundedBufferChannel,
   cancel_handle: CancelHandle,
   data: ReadableStreamResourceData,
+  size_hint: (u64, Option<u64>),
 }
 
 impl ReadableStreamResource {
@@ -360,6 +363,15 @@ impl ReadableStreamResource {
       .read(limit)
       .map(|buf| buf.unwrap_or_else(BufView::empty))
   }
+
+  fn close_channel(&self) {
+    // Trigger the promise in JS to cancel the stream if necessarily
+    self.data.completion.complete(true);
+    // Cancel any outstanding read requests
+    self.cancel_handle.cancel();
+    // Close the channel to wake up anyone waiting
+    self.channel.close();
+  }
 }
 
 impl Resource for ReadableStreamResource {
@@ -372,8 +384,17 @@ impl Resource for ReadableStreamResource {
   }
 
   fn close(self: Rc<Self>) {
-    self.cancel_handle.cancel();
-    self.channel.close();
+    self.close_channel();
+  }
+
+  fn size_hint(&self) -> (u64, Option<u64>) {
+    self.size_hint
+  }
+}
+
+impl Drop for ReadableStreamResource {
+  fn drop(&mut self) {
+    self.close_channel();
   }
 }
 
@@ -429,6 +450,25 @@ pub fn op_readable_stream_resource_allocate(state: &mut OpState) -> ResourceId {
     cancel_handle: Default::default(),
     channel: BoundedBufferChannel::default(),
     data: ReadableStreamResourceData { completion },
+    size_hint: (0, None),
+  };
+  state.resource_table.add(resource)
+}
+
+/// Allocate a resource that wraps a ReadableStream, with a size hint.
+#[op2(fast)]
+#[smi]
+pub fn op_readable_stream_resource_allocate_sized(
+  state: &mut OpState,
+  #[number] length: u64,
+) -> ResourceId {
+  let completion = CompletionHandle::default();
+  let resource = ReadableStreamResource {
+    read_queue: Default::default(),
+    cancel_handle: Default::default(),
+    channel: BoundedBufferChannel::default(),
+    data: ReadableStreamResourceData { completion },
+    size_hint: (length, Some(length)),
   };
   state.resource_table.add(resource)
 }
@@ -442,19 +482,24 @@ pub fn op_readable_stream_resource_get_sink(
   else {
     return std::ptr::null();
   };
-  resource.channel.clone().into_raw() as _
+  ExternalPointer::new(resource.channel.clone()).into_raw()
 }
+
+external!(BoundedBufferChannel, "stream resource channel");
 
 fn get_sender(sender: *const c_void) -> BoundedBufferChannel {
   // SAFETY: We know this is a valid v8::External
-  unsafe { BoundedBufferChannel::clone_from_raw(sender as _) }
+  unsafe {
+    ExternalPointer::<BoundedBufferChannel>::from_raw(sender)
+      .unsafely_deref()
+      .clone()
+  }
 }
 
 fn drop_sender(sender: *const c_void) {
   // SAFETY: We know this is a valid v8::External
   unsafe {
-    assert!(!sender.is_null());
-    _ = Rc::from_raw(sender as *mut RefCell<BoundedBufferChannelInner>);
+    ExternalPointer::<BoundedBufferChannel>::from_raw(sender).unsafely_take();
   }
 }
 
@@ -471,18 +516,35 @@ pub fn op_readable_stream_resource_write_buf(
   }
 }
 
-#[op2(async)]
+/// Write to the channel synchronously, returning 0 if the channel was closed, 1 if we wrote
+/// successfully, 2 if the channel was full and we need to block.
+#[op2(fast)]
+pub fn op_readable_stream_resource_write_sync(
+  sender: *const c_void,
+  #[buffer] buffer: JsBuffer,
+) -> u32 {
+  let sender = get_sender(sender);
+  if sender.can_write() {
+    if sender.closed() {
+      0
+    } else {
+      sender.write(buffer.into_parts()).unwrap();
+      1
+    }
+  } else {
+    2
+  }
+}
+
+#[op2(fast)]
 pub fn op_readable_stream_resource_write_error(
   sender: *const c_void,
   #[string] error: String,
-) -> impl Future<Output = bool> {
+) -> bool {
   let sender = get_sender(sender);
-  async move {
-    // We can always write an error, no polling required
-    // TODO(mmastrac): we can remove async from this method
-    sender.write_error(type_error(Cow::Owned(error)));
-    !sender.closed()
-  }
+  // We can always write an error, no polling required
+  sender.write_error(type_error(Cow::Owned(error)));
+  !sender.closed()
 }
 
 #[op2(fast)]

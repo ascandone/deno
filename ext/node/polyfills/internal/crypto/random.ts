@@ -8,7 +8,7 @@ import { notImplemented } from "ext:deno_node/_utils.ts";
 import randomBytes from "ext:deno_node/internal/crypto/_randomBytes.ts";
 import randomFill, {
   randomFillSync,
-} from "ext:deno_node/internal/crypto/_randomFill.ts";
+} from "ext:deno_node/internal/crypto/_randomFill.mjs";
 import randomInt from "ext:deno_node/internal/crypto/_randomInt.ts";
 import {
   validateBoolean,
@@ -29,10 +29,10 @@ export { default as randomBytes } from "ext:deno_node/internal/crypto/_randomByt
 export {
   default as randomFill,
   randomFillSync,
-} from "ext:deno_node/internal/crypto/_randomFill.ts";
+} from "ext:deno_node/internal/crypto/_randomFill.mjs";
 export { default as randomInt } from "ext:deno_node/internal/crypto/_randomInt.ts";
 
-const primordials = globalThis.__bootstrap.primordials;
+import { primordials } from "ext:core/mod.js";
 const { StringPrototypePadStart, StringPrototypeToString } = primordials;
 
 const { core } = globalThis.__bootstrap;

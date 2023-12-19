@@ -32,10 +32,12 @@ use tower_lsp::lsp_types::WorkDoneProgressParams;
 use tower_lsp::LanguageServer;
 
 use super::client::Client;
+use super::config::ClassMemberSnippets;
 use super::config::CompletionSettings;
 use super::config::DenoCompletionSettings;
 use super::config::ImportCompletionSettings;
 use super::config::LanguageWorkspaceSettings;
+use super::config::ObjectLiteralMethodSnippets;
 use super::config::TestingSettings;
 use super::config::WorkspaceSettings;
 
@@ -59,8 +61,10 @@ impl ReplLanguageServer {
     super::logging::set_lsp_log_level(log::Level::Debug);
     super::logging::set_lsp_warn_level(log::Level::Debug);
 
-    let language_server =
-      super::language_server::LanguageServer::new(Client::new_for_repl());
+    let language_server = super::language_server::LanguageServer::new(
+      Client::new_for_repl(),
+      Default::default(),
+    );
 
     let cwd_uri = get_cwd_uri()?;
 
@@ -292,9 +296,11 @@ pub fn get_repl_workspace_settings() -> WorkspaceSettings {
     config: None,
     certificate_stores: None,
     cache: None,
+    cache_on_save: false,
     import_map: None,
     code_lens: Default::default(),
     internal_debug: false,
+    log_file: false,
     lint: false,
     document_preload_limit: 0, // don't pre-load any modules as it's expensive and not useful for the repl
     tls_certificate: None,
@@ -308,22 +314,36 @@ pub fn get_repl_workspace_settings() -> WorkspaceSettings {
     },
     testing: TestingSettings { args: vec![] },
     javascript: LanguageWorkspaceSettings {
-      inlay_hints: Default::default(),
       suggest: CompletionSettings {
-        complete_function_calls: false,
-        names: false,
-        paths: false,
         auto_imports: false,
+        class_member_snippets: ClassMemberSnippets { enabled: false },
+        complete_function_calls: false,
+        enabled: true,
+        include_automatic_optional_chain_completions: false,
+        include_completions_for_import_statements: true,
+        names: false,
+        object_literal_method_snippets: ObjectLiteralMethodSnippets {
+          enabled: false,
+        },
+        paths: false,
       },
+      ..Default::default()
     },
     typescript: LanguageWorkspaceSettings {
-      inlay_hints: Default::default(),
       suggest: CompletionSettings {
-        complete_function_calls: false,
-        names: false,
-        paths: false,
         auto_imports: false,
+        class_member_snippets: ClassMemberSnippets { enabled: false },
+        complete_function_calls: false,
+        enabled: true,
+        include_automatic_optional_chain_completions: false,
+        include_completions_for_import_statements: true,
+        names: false,
+        object_literal_method_snippets: ObjectLiteralMethodSnippets {
+          enabled: false,
+        },
+        paths: false,
       },
+      ..Default::default()
     },
   }
 }

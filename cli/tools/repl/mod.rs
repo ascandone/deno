@@ -3,17 +3,19 @@
 use crate::args::CliOptions;
 use crate::args::Flags;
 use crate::args::ReplFlags;
+use crate::cdp;
 use crate::colors;
 use crate::factory::CliFactory;
 use crate::file_fetcher::FileFetcher;
 use deno_core::error::AnyError;
 use deno_core::futures::StreamExt;
+use deno_core::serde_json;
 use deno_core::unsync::spawn_blocking;
 use deno_runtime::permissions::Permissions;
 use deno_runtime::permissions::PermissionsContainer;
 use rustyline::error::ReadlineError;
+use tokio::sync::mpsc::unbounded_channel;
 
-pub(crate) mod cdp;
 mod channel;
 mod editor;
 mod session;
@@ -27,6 +29,9 @@ use editor::ReplEditor;
 pub use session::EvaluationOutput;
 pub use session::ReplSession;
 pub use session::REPL_INTERNALS_NAME;
+
+use super::test::TestEvent;
+use super::test::TestEventSender;
 
 #[allow(clippy::await_holding_refcell_ref)]
 async fn read_line_and_poll(
@@ -66,14 +71,11 @@ async fn read_line_and_poll(
       }
       message = notifications.next() => {
         if let Some(message) = message {
-          let method = message.get("method").unwrap().as_str().unwrap();
-          if method == "Runtime.exceptionThrown" {
-            let params = message.get("params").unwrap().as_object().unwrap();
-            let exception_details = params.get("exceptionDetails").unwrap().as_object().unwrap();
-            let text = exception_details.get("text").unwrap().as_str().unwrap();
-            let exception = exception_details.get("exception").unwrap().as_object().unwrap();
-            let description = exception.get("description").and_then(|d| d.as_str()).unwrap_or("undefined");
-            println!("{text} {description}");
+          let notification: cdp::Notification = serde_json::from_value(message).unwrap();
+          if notification.method == "Runtime.exceptionThrown" {
+            let exception_thrown: cdp::ExceptionThrown = serde_json::from_value(notification.params).unwrap();
+            let (message, description) = exception_thrown.exception_details.get_message_and_description();
+            println!("{} {}", message, description);
           }
         }
       }
@@ -114,15 +116,31 @@ pub async fn run(flags: Flags, repl_flags: ReplFlags) -> Result<i32, AnyError> {
     .deno_dir()
     .ok()
     .and_then(|dir| dir.repl_history_file_path());
-
+  let (test_event_sender, test_event_receiver) =
+    unbounded_channel::<TestEvent>();
+  let test_event_sender = TestEventSender::new(test_event_sender);
   let mut worker = worker_factory
-    .create_main_worker(main_module, permissions)
+    .create_custom_worker(
+      main_module.clone(),
+      permissions,
+      vec![crate::ops::testing::deno_test::init_ops(
+        test_event_sender.clone(),
+      )],
+      Default::default(),
+    )
     .await?;
   worker.setup_repl().await?;
   let worker = worker.into_main_worker();
-  let mut repl_session =
-    ReplSession::initialize(cli_options, npm_resolver, resolver, worker)
-      .await?;
+  let mut repl_session = ReplSession::initialize(
+    cli_options,
+    npm_resolver,
+    resolver,
+    worker,
+    main_module,
+    test_event_sender,
+    test_event_receiver,
+  )
+  .await?;
   let mut rustyline_channel = rustyline_channel();
 
   let helper = EditorHelper {

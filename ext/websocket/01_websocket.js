@@ -2,9 +2,10 @@
 
 /// <reference path="../../core/internal.d.ts" />
 
-const core = globalThis.Deno.core;
+import { core, primordials } from "ext:core/mod.js";
 import { URL } from "ext:deno_url/00_url.js";
 import * as webidl from "ext:deno_webidl/00_webidl.js";
+import { createFilteredInspectProxy } from "ext:deno_console/01_console.js";
 import { HTTP_TOKEN_CODE_POINT_RE } from "ext:deno_web/00_infra.js";
 import DOMException from "ext:deno_web/01_dom_exception.js";
 import {
@@ -19,14 +20,12 @@ import {
 } from "ext:deno_web/02_event.js";
 import { Blob, BlobPrototype } from "ext:deno_web/09_file.js";
 import { getLocationHref } from "ext:deno_web/12_location.js";
-const primordials = globalThis.__bootstrap.primordials;
 const {
   ArrayBufferPrototype,
   ArrayBufferIsView,
   ArrayPrototypeJoin,
   ArrayPrototypeMap,
   ArrayPrototypeSome,
-  DataView,
   ErrorPrototypeToString,
   ObjectDefineProperties,
   ObjectPrototypeIsPrototypeOf,
@@ -50,6 +49,7 @@ const {
   op_ws_create,
   op_ws_close,
   op_ws_send_binary,
+  op_ws_send_binary_ab,
   op_ws_send_text,
   op_ws_next_event,
   op_ws_get_buffer,
@@ -336,11 +336,7 @@ class WebSocket extends EventTarget {
       PromisePrototypeThen(
         // deno-lint-ignore prefer-primordials
         data.slice().arrayBuffer(),
-        (ab) =>
-          op_ws_send_binary(
-            this[_rid],
-            new DataView(ab),
-          ),
+        (ab) => op_ws_send_binary_ab(this[_rid], ab),
       );
     } else {
       const string = String(data);
@@ -540,17 +536,26 @@ class WebSocket extends EventTarget {
     }
   }
 
-  [SymbolFor("Deno.customInspect")](inspect) {
-    return `${this.constructor.name} ${
-      inspect({
-        url: this.url,
-        readyState: this.readyState,
-        extensions: this.extensions,
-        protocol: this.protocol,
-        binaryType: this.binaryType,
-        bufferedAmount: this.bufferedAmount,
-      })
-    }`;
+  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+    return inspect(
+      createFilteredInspectProxy({
+        object: this,
+        evaluate: ObjectPrototypeIsPrototypeOf(WebSocketPrototype, this),
+        keys: [
+          "url",
+          "readyState",
+          "extensions",
+          "protocol",
+          "binaryType",
+          "bufferedAmount",
+          "onmessage",
+          "onerror",
+          "onclose",
+          "onopen",
+        ],
+      }),
+      inspectOptions,
+    );
   }
 }
 
@@ -574,8 +579,22 @@ defineEventHandler(WebSocket.prototype, "error");
 defineEventHandler(WebSocket.prototype, "close");
 defineEventHandler(WebSocket.prototype, "open");
 
-webidl.configurePrototype(WebSocket);
+webidl.configureInterface(WebSocket);
 const WebSocketPrototype = WebSocket.prototype;
+
+function createWebSocketBranded() {
+  const socket = webidl.createBranded(WebSocket);
+  socket[_rid] = undefined;
+  socket[_role] = undefined;
+  socket[_readyState] = CONNECTING;
+  socket[_extensions] = "";
+  socket[_protocol] = "";
+  socket[_url] = "";
+  socket[_binaryType] = "blob";
+  socket[_idleTimeoutDuration] = 0;
+  socket[_idleTimeoutTimeout] = undefined;
+  return socket;
+}
 
 export {
   _eventLoop,
@@ -587,6 +606,7 @@ export {
   _role,
   _server,
   _serverHandleIdleTimeout,
+  createWebSocketBranded,
   SERVER,
   WebSocket,
 };
